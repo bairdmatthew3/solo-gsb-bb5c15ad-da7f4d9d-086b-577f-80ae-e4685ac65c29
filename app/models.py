@@ -224,3 +224,107 @@ class AssignResponse(BaseModel):
     bottleneck_cut: BottleneckCutOut | None = None
     # balance_workload 启用且可行时的负载均衡结果；否则为 null
     balance: WorkloadBalanceOut | None = None
+
+
+# ---------- POST /assign-roles：分角色分配 ----------
+
+_RoleName = Annotated[str, Field(min_length=1, max_length=128)]
+_RoleRequired = Annotated[int, Field(ge=0, le=100)]
+
+
+class RoleManuscriptIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(min_length=1, max_length=128, description="稿件 ID（唯一）")
+    authors: list[str] = Field(default_factory=list, max_length=512, description="作者名单")
+    topics: list[str] = Field(default_factory=list, max_length=64, description="稿件主题")
+    role_requirements: dict[_RoleName, _RoleRequired] = Field(
+        max_length=64,
+        description="各评审角色所需人数：角色 -> 非负整数人数（0 表示该角色无需评审）",
+    )
+    track: str | None = Field(
+        default=None, min_length=1, max_length=128,
+        description="稿件所属赛道；缺省表示不参与分赛道容量控制",
+    )
+
+
+class RoleReviewerIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(min_length=1, max_length=128, description="评审人 ID（唯一）")
+    topics: list[str] = Field(default_factory=list, max_length=64, description="主题能力")
+    capacity: int = Field(
+        ge=0, le=1000,
+        description="最多可承担的评审任务数（不分角色、不分稿件，合计）",
+    )
+    roles: list[_RoleName] = Field(
+        default_factory=list, max_length=64,
+        description="可担任的评审角色列表（重复项自动去重）；缺省表示不能担任任何角色",
+    )
+    conflicted_authors: list[str] = Field(
+        default_factory=list, max_length=2048, description="存在利益冲突的作者名单"
+    )
+    conflicted_manuscripts: list[str] = Field(
+        default_factory=list, max_length=2048, description="需回避的稿件 ID 列表"
+    )
+    track_capacities: dict[_TrackName, _TrackCapacity] | None = Field(
+        default=None, max_length=64,
+        description=(
+            "分赛道容量：赛道 -> 该赛道最多可评审的稿件数（非负整数）。"
+            "映射中出现的赛道同时受赛道限额与总容量约束；"
+            "未列出的赛道仅受总容量约束"
+        ),
+    )
+
+
+class RoleAssignRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    manuscripts: list[RoleManuscriptIn] = Field(max_length=10000)
+    reviewers: list[RoleReviewerIn] = Field(max_length=10000)
+
+    @model_validator(mode="after")
+    def _check_unique_ids(self) -> "RoleAssignRequest":
+        m_ids = [m.id for m in self.manuscripts]
+        if len(m_ids) != len(set(m_ids)):
+            raise ValueError("manuscripts 中存在重复的 id")
+        r_ids = [r.id for r in self.reviewers]
+        if len(r_ids) != len(set(r_ids)):
+            raise ValueError("reviewers 中存在重复的 id")
+        return self
+
+
+class RoleAssignmentOut(BaseModel):
+    """某稿件某角色分得的评审人名单（按 ID 排序）。"""
+
+    role: str
+    reviewer_ids: list[str]
+
+
+class ManuscriptRolesOut(BaseModel):
+    """某稿件的完整分角色名单（角色按名称排序）。"""
+
+    manuscript_id: str
+    roles: list[RoleAssignmentOut]
+
+
+class RoleUnsatisfiedOut(BaseModel):
+    """不可行时某稿件某角色的缺口诊断。"""
+
+    manuscript_id: str
+    role: str
+    required: int
+    assigned: int
+    missing: int
+    eligible_reviewers: int
+    eligible_remaining_capacity: int
+
+
+class RoleAssignResponse(BaseModel):
+    status: Literal["feasible", "infeasible"]
+    total_required: int
+    total_assigned: int
+    # 可行时给出按稿件、角色分组的完整名单；不可行时为 null（不输出部分结果）
+    assignments: list[ManuscriptRolesOut] | None
+    # 不可行时给出各角色缺口诊断；可行时为 null
+    unsatisfied: list[RoleUnsatisfiedOut] | None

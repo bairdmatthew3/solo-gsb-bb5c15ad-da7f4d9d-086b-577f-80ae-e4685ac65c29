@@ -51,6 +51,19 @@ max_cap）：先在 1/max_cap 整数网格上二分，把最优值定位到宽�
 运算，全程不引入浮点）；找到最优比例后，把收紧后的容量交给最小费用最大流完成
 第 2、3 级优化。无完整可行解时（负载率 1 仍不可行）沿用普通 / 增量模式的诊断，
 不输出任何部分分配。
+
+分角色分配（solve_role_assignment，对应 POST /assign-roles）：稿件按角色声明
+所需人数、评审人声明可担任角色，全部稿件的全部角色在同一个流网络中一次全局求解：
+
+    源 --(角色所需人数)--> (稿件,角色) --(1, 合格且可担任)--> (稿件,评审人) --(1)-->
+    评审人/(评审人,赛道) --(赛道限额)--> 评审人 --(总容量)--> 汇
+
+- (稿件,评审人) 去重节点的出边容量为 1：同一评审人对同一稿件最多承担一个角色；
+- 全部角色共享评审人总容量与赛道限额，在同一网络中联立求解（而非按角色分别
+  分配后拼接，避免各角色争用共享容量）；
+- 主题、利益冲突、自稿回避与分赛道限额规则与 /assign 完全一致（复用同一套
+  资格过滤）；可行时返回按稿件、角色分组且顺序确定的完整名单，不可行时按
+  (稿件, 角色) 返回缺口诊断，不输出任何部分分配。
 """
 
 from __future__ import annotations
@@ -68,6 +81,8 @@ class ManuscriptSpec:
     topics: tuple[str, ...]
     required_reviewers: int
     track: str | None = None
+    # (角色, 所需人数) 对，按角色名排序；仅分角色分配（/assign-roles）使用
+    role_requirements: tuple[tuple[str, int], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -79,6 +94,8 @@ class ReviewerSpec:
     conflicted_manuscripts: tuple[str, ...]
     # (赛道, 限额) 对，按赛道名排序；缺省为空表示不做分赛道限制
     track_capacities: tuple[tuple[str, int], ...] = ()
+    # 可担任的评审角色（去重排序）；仅分角色分配（/assign-roles）使用
+    roles: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -168,6 +185,29 @@ class WorkloadBalance:
 
 
 @dataclass(frozen=True)
+class RoleUnsatisfied:
+    """分角色分配不可行时，某稿件某角色的缺口诊断。"""
+
+    manuscript_id: str
+    role: str
+    required: int
+    assigned: int
+    missing: int
+    eligible_reviewers: int
+    eligible_remaining_capacity: int
+
+
+@dataclass(frozen=True)
+class RoleSolveResult:
+    feasible: bool
+    # manuscript_id -> {角色 -> 已排序的 reviewer id 元组}；不可行时为空（不输出部分结果）
+    assignments: dict[str, dict[str, tuple[str, ...]]]
+    total_required: int
+    total_assigned: int
+    unsatisfied: tuple[RoleUnsatisfied, ...]
+
+
+@dataclass(frozen=True)
 class SolveResult:
     feasible: bool
     # manuscript_id -> 已排序的 reviewer id 元组；不可行时为空（不输出部分结果）
@@ -230,11 +270,12 @@ class _MaxFlow:
 
 
 class _DinicFlow:
-    """Dinic 最大流（邻接表，仅取流量值）。
+    """Dinic 最大流（邻接表）。
 
-    仅用于负载均衡二分中的可行性判定：最大流值与算法无关，判定结果与用
-    Edmonds-Karp 完全一致，不影响最终分配的确定性（最终分配仍由最小费用
-    最大流产出）。邻接表按插入顺序遍历，分层与增广顺序固定。
+    用于负载均衡二分中的可行性判定与分角色分配求解：最大流值与算法无关，
+    判定结果与用 Edmonds-Karp 完全一致，不影响最终分配的确定性（负载均衡的
+    最终分配仍由最小费用最大流产出）。邻接表按插入顺序遍历，分层与增广顺序
+    固定；建图顺序确定则结果确定。
     """
 
     def __init__(self, n: int) -> None:
@@ -242,11 +283,22 @@ class _DinicFlow:
         # 边: [to, 残余容量, 反向边在 g[to] 中的下标]
         self.g: list[list[list[int]]] = [[] for _ in range(n)]
 
-    def add_edge(self, u: int, v: int, c: int) -> None:
+    def add_edge(self, u: int, v: int, c: int) -> int:
+        """返回正向边在 g[u] 中的下标；容量为 0 的边不建（返回 -1）。"""
         if c <= 0:
-            return
+            return -1
         self.g[u].append([v, c, len(self.g[v])])
         self.g[v].append([u, 0, len(self.g[u]) - 1])
+        return len(self.g[u]) - 1
+
+    def residual(self, u: int, ei: int) -> int:
+        """正向边 (u, ei) 的残余容量。"""
+        return self.g[u][ei][1]
+
+    def flow_on(self, u: int, ei: int) -> int:
+        """正向边 (u, ei) 上的流量（即反向边的残余容量）。"""
+        e = self.g[u][ei]
+        return self.g[e[0]][e[2]][1]
 
     def max_flow(self, s: int, t: int) -> int:
         g = self.g
@@ -1232,4 +1284,162 @@ def _solve_balanced(
             max_load_ratio_den=best_ratio.denominator,
             changes=changes,
         ),
+    )
+
+
+def solve_role_assignment(
+    manuscripts: list[ManuscriptSpec],
+    reviewers: list[ReviewerSpec],
+) -> RoleSolveResult:
+    """分角色全局分配：全部稿件的全部角色在同一个流网络中一次求解。
+
+    网络结构：
+
+        源 --(角色所需人数)--> (稿件,角色) --(1, 合格且可担任)--> (稿件,评审人)
+            --(1)--> 评审人/(评审人,赛道) --(赛道限额)--> 评审人 --(总容量)--> 汇
+
+    - (稿件,评审人) 去重节点出边容量为 1：同一评审人对同一稿件最多承担一个角色；
+    - 全部角色共享评审人总容量与赛道限额，联立求解而非按角色分别分配后拼接；
+    - 主题、利益冲突、自稿回避规则与 /assign 完全一致（复用 _eligible_reviewers）；
+    - 所有节点按业务 ID 排序后建图，算法无随机性：相同输入（甚至不同的列表顺序）
+      必然产生完全相同的分配结果。
+    """
+    # 按 ID 排序，角色需求统一按角色名排序：建图顺序与输入列表顺序无关 -> 输出稳定
+    ms = sorted(manuscripts, key=lambda m: m.id)
+    rs = sorted(reviewers, key=lambda r: r.id)
+    m_count, r_count = len(ms), len(rs)
+    role_reqs = [tuple(sorted(m.role_requirements)) for m in ms]
+    roles = [set(r.roles) for r in rs]
+    eligible = [_eligible_reviewers(m, rs) for m in ms]
+
+    SRC = 0
+    # 节点布局：SRC | (稿件,角色) 需求节点 | (稿件,评审人) 去重节点 | 评审人
+    #          | (评审人,赛道) 限额节点 | SNK
+    nxt = 1
+    demand_node: list[dict[str, int]] = []
+    for i in range(m_count):
+        nodes: dict[str, int] = {}
+        for role, _n in role_reqs[i]:
+            nodes[role] = nxt
+            nxt += 1
+        demand_node.append(nodes)
+    pair_node: list[dict[int, int]] = []
+    for i in range(m_count):
+        nodes = {}
+        for j in eligible[i]:
+            nodes[j] = nxt
+            nxt += 1
+        pair_node.append(nodes)
+    r_base = nxt
+    nxt += r_count
+
+    def r_node(j: int) -> int:
+        return r_base + j
+
+    track_nodes: list[dict[str, int]] = []
+    for r in rs:
+        nodes = {}
+        for track, _cap in sorted(r.track_capacities):
+            nodes[track] = nxt
+            nxt += 1
+        track_nodes.append(nodes)
+    SNK = nxt
+
+    track_caps = [dict(r.track_capacities) for r in rs]
+    mf = _DinicFlow(SNK + 1)
+    for i in range(m_count):
+        for role, n in role_reqs[i]:
+            mf.add_edge(SRC, demand_node[i][role], n)
+    # (稿件下标, 角色, 评审下标, 边下标)：角色资格边，容量 1
+    role_edges: list[tuple[int, str, int, int]] = []
+    for i in range(m_count):
+        for role, _n in role_reqs[i]:
+            u = demand_node[i][role]
+            for j in eligible[i]:
+                if role in roles[j]:
+                    ei = mf.add_edge(u, pair_node[i][j], 1)
+                    role_edges.append((i, role, j, ei))
+    for i in range(m_count):
+        for j in eligible[i]:
+            # 赛道受该评审人限额约束时走 (评审人, 赛道) 限额节点，与 /assign 一致
+            target = r_node(j)
+            track = ms[i].track
+            if track is not None:
+                node = track_nodes[j].get(track)
+                if node is not None:
+                    target = node
+            mf.add_edge(pair_node[i][j], target, 1)
+    track_edge_idx: list[dict[str, int]] = []  # 评审下标 -> {赛道: 边下标}（限额 0 不建边）
+    for j in range(r_count):
+        idx: dict[str, int] = {}
+        for track, node in track_nodes[j].items():
+            ei = mf.add_edge(node, r_node(j), track_caps[j][track])
+            if ei >= 0:
+                idx[track] = ei
+        track_edge_idx.append(idx)
+    r_edge_idx: list[int] = []  # 评审下标 -> 评审->汇边下标（容量 0 时为 -1）
+    for j, r in enumerate(rs):
+        r_edge_idx.append(mf.add_edge(r_node(j), SNK, r.capacity))
+
+    total_required = sum(n for req in role_reqs for _role, n in req)
+    total_assigned = mf.max_flow(SRC, SNK)
+
+    # 提取分配：角色资格边容量为 1，边上的流量即「该评审人对该稿件担任该角色」
+    assigned_by: dict[tuple[int, str], list[str]] = {}
+    for i, role, j, ei in role_edges:
+        if mf.flow_on(demand_node[i][role], ei) > 0:
+            assigned_by.setdefault((i, role), []).append(rs[j].id)
+
+    if total_assigned == total_required:
+        assignments: dict[str, dict[str, tuple[str, ...]]] = {}
+        for i, m in enumerate(ms):
+            assignments[m.id] = {
+                role: tuple(sorted(assigned_by.get((i, role), [])))
+                for role, _n in role_reqs[i]
+            }
+        return RoleSolveResult(
+            feasible=True,
+            assignments=assignments,
+            total_required=total_required,
+            total_assigned=total_assigned,
+            unsatisfied=(),
+        )
+
+    # ---- 不可行：按 (稿件, 角色) 给出缺口诊断，不输出任何部分分配 ----
+    def remaining_capacity(j: int, track: str | None) -> int:
+        """评审人 j 对该赛道稿件的剩余可接量：总剩余与赛道剩余取小。"""
+        ei = r_edge_idx[j]
+        remaining = mf.residual(r_node(j), ei) if ei >= 0 else 0
+        if track is not None:
+            tei = track_edge_idx[j].get(track)
+            if tei is not None:
+                remaining = min(remaining, mf.residual(track_nodes[j][track], tei))
+            elif track in track_nodes[j]:
+                remaining = 0  # 赛道限额为 0（未建边）
+        return remaining
+
+    unsatisfied: list[RoleUnsatisfied] = []
+    for i, m in enumerate(ms):
+        for role, n in role_reqs[i]:
+            assigned = len(assigned_by.get((i, role), []))
+            if assigned >= n:
+                continue
+            role_eligible = [j for j in eligible[i] if role in roles[j]]
+            unsatisfied.append(RoleUnsatisfied(
+                manuscript_id=m.id,
+                role=role,
+                required=n,
+                assigned=assigned,
+                missing=n - assigned,
+                eligible_reviewers=len(role_eligible),
+                eligible_remaining_capacity=sum(
+                    remaining_capacity(j, m.track) for j in role_eligible
+                ),
+            ))
+    return RoleSolveResult(
+        feasible=False,
+        assignments={},
+        total_required=total_required,
+        total_assigned=total_assigned,
+        unsatisfied=tuple(unsatisfied),
     )

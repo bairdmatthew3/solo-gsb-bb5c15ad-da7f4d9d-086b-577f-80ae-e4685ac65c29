@@ -33,6 +33,13 @@
 最后按 ID 破同；负载率全程以约分分数（整数分子/分母）表示与比较，**不依赖浮点数**，
 响应返回最优最大负载率的约分分数与改动数。
 
+`POST /assign-roles` 提供**分角色分配**：稿件按角色声明所需人数（`role_requirements`，
+如 `{"chair": 1, "reviewer": 2}`），评审人声明可担任角色（`roles`）；全部稿件的全部
+角色在**同一个流网络中一次全局求解**（而非按角色分别分配后拼接，避免各角色争用共享
+容量），同一评审人对同一稿件**最多承担一个角色**，所有角色共享评审人总容量与赛道限额。
+可行时返回按稿件、角色分组且顺序确定的完整名单；不可行时按角色返回缺口，
+不输出任何部分分配。
+
 ## 快速启动（单条命令）
 
 ```bash
@@ -47,6 +54,7 @@ docker compose up --build
 | --- | --- |
 | http://localhost:8000/health | 健康检查 |
 | http://localhost:8000/assign | 分配接口（POST） |
+| http://localhost:8000/assign-roles | 分角色分配接口（POST） |
 | http://localhost:8000/docs | Swagger 交互式文档 |
 | http://localhost:8000/redoc | ReDoc 文档 |
 
@@ -478,6 +486,96 @@ docker run -p 8000:8000 review-assign
 模式的不可行情形完全一致（`unsatisfied` / `shared_pool` / `bottleneck_cut`
 诊断，`balance` 为 `null`），不输出任何部分分配。
 
+### `POST /assign-roles`（分角色分配）
+
+稿件按**角色**声明所需评审人数，评审人声明**可担任角色**；全部稿件的全部角色在
+**同一个流网络中一次全局求解**（而非按角色分别分配后拼接，避免各角色争用共享
+容量）。主题匹配、利益冲突（含自稿回避）、总容量与分赛道限额规则与
+`POST /assign` 完全一致，另加两条角色规则：
+
+- 评审人只能担任其 `roles` 中声明的角色（缺省为空，即不能担任任何角色）；
+- 同一评审人对同一稿件**最多承担一个角色**（容量再大也不能身兼两角）；
+- 所有角色、所有稿件共享评审人的总容量与赛道限额（每承担一个角色计 1 份负载）。
+
+请求体：
+
+```json
+{
+  "manuscripts": [
+    {"id": "m1", "authors": ["alice"], "topics": ["ml"],
+     "role_requirements": {"chair": 1, "reviewer": 1}},
+    {"id": "m2", "authors": ["bob"], "topics": ["db"], "track": "poster",
+     "role_requirements": {"reviewer": 2}}
+  ],
+  "reviewers": [
+    {"id": "r1", "topics": ["ml"], "capacity": 2, "roles": ["chair", "reviewer"]},
+    {"id": "r2", "topics": ["ml", "db"], "capacity": 2, "roles": ["reviewer"]},
+    {"id": "r3", "topics": ["db"], "capacity": 2, "roles": ["reviewer"],
+     "track_capacities": {"poster": 1}}
+  ]
+}
+```
+
+字段规则：
+
+- 稿件 `role_requirements`：`角色 -> 非负整数人数` 的映射（必填，可为空对象）；
+  需求为 0 的角色在可行响应中仍会出现（空名单），保证输出结构完整确定。
+- 评审人 `roles`：可担任角色列表（缺省为空列表，重复项自动去重）。
+- 其余字段（`authors` / `topics` / `capacity` / `conflicted_authors` /
+  `conflicted_manuscripts` / `track` / `track_capacities`）语义与
+  `POST /assign` 完全相同。
+- 稿件 / 评审人 `id` 必须各自唯一，否则返回 `422`。
+
+可行时响应（`200`）：按稿件、角色分组的完整名单——稿件按 ID 排序、角色按名称
+排序、名单按 ID 排序，相同输入（甚至不同的列表顺序）必然产生完全相同的输出：
+
+```json
+{
+  "status": "feasible",
+  "total_required": 4,
+  "total_assigned": 4,
+  "assignments": [
+    {"manuscript_id": "m1", "roles": [
+      {"role": "chair", "reviewer_ids": ["r1"]},
+      {"role": "reviewer", "reviewer_ids": ["r2"]}
+    ]},
+    {"manuscript_id": "m2", "roles": [
+      {"role": "reviewer", "reviewer_ids": ["r2", "r3"]}
+    ]}
+  ],
+  "unsatisfied": null
+}
+```
+
+不可行时响应（`200`，`assignments` 为 `null`，**不输出任何部分分配**），按
+（稿件, 角色）给出缺口诊断：
+
+```json
+{
+  "status": "infeasible",
+  "total_required": 3,
+  "total_assigned": 2,
+  "assignments": null,
+  "unsatisfied": [
+    {
+      "manuscript_id": "m1",
+      "role": "chair",
+      "required": 1,
+      "assigned": 0,
+      "missing": 1,
+      "eligible_reviewers": 0,
+      "eligible_remaining_capacity": 0
+    }
+  ]
+}
+```
+
+诊断字段含义：
+
+- `eligible_reviewers`：通过主题与冲突过滤、且声明可担任该角色的候选人数；
+- `eligible_remaining_capacity`：最大流结束后这些候选对该稿赛道的剩余可接量之和
+  （候选受赛道限额约束时，取总剩余容量与赛道剩余限额的较小者）。
+
 ### 示例调用
 
 ```bash
@@ -557,6 +655,26 @@ curl -s -X POST http://localhost:8000/assign \
       }'
 # -> assignments 为 m1->r1、m2->r2（接受 1 新增 1 移除，把最大负载率从 1 压到 1/2）；
 #    balance = {"max_load_ratio": {"numerator": 1, "denominator": 2}, "changes": 2}
+
+# 分角色分配：全部角色一次全局求解，同一评审人对同一稿件最多承担一个角色
+curl -s -X POST http://localhost:8000/assign-roles \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "manuscripts": [
+          {"id": "m1", "authors": ["alice"], "topics": ["ml"],
+           "role_requirements": {"chair": 1, "reviewer": 1}},
+          {"id": "m2", "authors": ["bob"], "topics": ["db"], "track": "poster",
+           "role_requirements": {"reviewer": 2}}
+        ],
+        "reviewers": [
+          {"id": "r1", "topics": ["ml"], "capacity": 2, "roles": ["chair", "reviewer"]},
+          {"id": "r2", "topics": ["ml", "db"], "capacity": 2, "roles": ["reviewer"]},
+          {"id": "r3", "topics": ["db"], "capacity": 2, "roles": ["reviewer"],
+           "track_capacities": {"poster": 1}}
+        ]
+      }'
+# -> assignments 按稿件、角色分组：m1 的 chair->r1、reviewer->r2（r1 不能身兼两角），
+#    m2 的 reviewer->r2、r3（r3 的 poster 赛道限额 1 与总容量同时生效）
 ```
 
 ## 算法与确定性
@@ -587,6 +705,12 @@ curl -s -X POST http://localhost:8000/assign \
   至多 `max_cap` 个精确分数候选中二分（每次判定为一次 Dinic 最大流可行性检查，
   评审人容量按 `floor(负载率 × capacity)` 收紧），最后用收紧容量下的最小费用
   最大流完成后两级优化；无完整解时沿用普通 / 增量模式的诊断，不输出部分分配。
+- 分角色分配（`/assign-roles`）：`源 -> (稿件,角色)（容量=该角色所需人数）->
+  (稿件,评审人)（容量=1，仅当评审人合格且可担任该角色）-> 评审人/(评审人,赛道)
+  （容量=1）-> 评审人（赛道限额）-> 汇（总容量）`。(稿件,评审人) 去重节点的出边
+  容量为 1，保证同一评审人对同一稿件最多承担一个角色；全部角色共享评审人总容量
+  与赛道限额，在同一流网络中一次求解（Dinic 最大流），避免按角色分别分配时争用
+  共享容量；不可行时按 (稿件, 角色) 输出缺口，不输出部分分配。
 - 所有节点按 ID 排序后建图，BFS / Dijkstra 均按固定邻接顺序与 (费用, 节点下标) 字典序
   执行，算法无随机性：相同输入（含不同的列表顺序）产生逐字节相同的输出，
   同成本解由 ID 顺序确定性地破除（瓶颈割的节点与边同样按业务 ID 确定排序）。
@@ -604,11 +728,12 @@ uvicorn app.main:app --reload --port 8000   # 本地起服务
 
 ```
 app/
-  main.py      # FastAPI 入口：/health、/assign
+  main.py      # FastAPI 入口：/health、/assign、/assign-roles
   models.py    # 请求/响应模型与校验
-  solver.py    # 分配求解器：普通模式全局最大流 + 增量模式最小费用最大流 + 负载均衡字典序优化
+  solver.py    # 分配求解器：普通模式全局最大流 + 增量模式最小费用最大流 + 负载均衡字典序优化 + 分角色全局分配
 tests/
-  test_assign.py
+  test_assign.py        # /assign 端到端测试
+  test_assign_roles.py  # /assign-roles 端到端测试
 Dockerfile
 docker-compose.yml
 requirements.txt

@@ -13,6 +13,11 @@ from .models import (
     BottleneckCutOut,
     LoadRatioOut,
     LockedConflictOut,
+    ManuscriptRolesOut,
+    RoleAssignRequest,
+    RoleAssignResponse,
+    RoleAssignmentOut,
+    RoleUnsatisfiedOut,
     SharedPoolOut,
     UnsatisfiedOut,
     WorkloadBalanceOut,
@@ -22,11 +27,12 @@ from .solver import (
     ManuscriptSpec,
     ReviewerSpec,
     solve_assignment,
+    solve_role_assignment,
 )
 
 app = FastAPI(
     title="Anonymous Review Assignment API",
-    version="1.4.0",
+    version="1.5.0",
     description=(
         "匿名评审分配服务：基于全局最大流（非逐稿贪心）求满足主题能力、"
         "利益冲突与容量约束的完整分配；不可行时返回缺口诊断与全局最小割证明"
@@ -39,6 +45,10 @@ app = FastAPI(
         "支持负载均衡：balance_workload=true 时完整可行解按字典序优化——"
         "先最小化最大负载率（分配数/capacity，约分分数比较，不依赖浮点），"
         "再最小化相对上一轮的改动数，最后按 ID 破同。"
+        "支持分角色分配（POST /assign-roles）：稿件按角色声明所需人数、"
+        "评审人声明可担任角色，全部稿件的全部角色在同一流网络中一次全局求解，"
+        "同一评审人对同一稿件最多承担一个角色，所有角色共享总容量与赛道限额；"
+        "可行时返回按稿件、角色分组的完整名单，不可行时返回各角色缺口。"
         "服务无状态，不持久化任何稿件/评审信息。"
     ),
 )
@@ -180,4 +190,63 @@ def assign(req: AssignRequest) -> AssignResponse:
             if result.bottleneck_cut
             else None
         ),
+    )
+
+
+@app.post("/assign-roles", response_model=RoleAssignResponse, tags=["assign"])
+def assign_roles(req: RoleAssignRequest) -> RoleAssignResponse:
+    manuscripts = [
+        ManuscriptSpec(
+            id=m.id,
+            authors=tuple(m.authors),
+            topics=tuple(m.topics),
+            required_reviewers=0,
+            track=m.track,
+            role_requirements=tuple(sorted(m.role_requirements.items())),
+        )
+        for m in req.manuscripts
+    ]
+    reviewers = [
+        ReviewerSpec(
+            id=r.id,
+            topics=tuple(r.topics),
+            capacity=r.capacity,
+            conflicted_authors=tuple(r.conflicted_authors),
+            conflicted_manuscripts=tuple(r.conflicted_manuscripts),
+            track_capacities=(
+                tuple(sorted(r.track_capacities.items()))
+                if r.track_capacities
+                else ()
+            ),
+            roles=tuple(sorted(set(r.roles))),
+        )
+        for r in req.reviewers
+    ]
+
+    result = solve_role_assignment(manuscripts, reviewers)
+
+    if result.feasible:
+        return RoleAssignResponse(
+            status="feasible",
+            total_required=result.total_required,
+            total_assigned=result.total_assigned,
+            assignments=[
+                ManuscriptRolesOut(
+                    manuscript_id=mid,
+                    roles=[
+                        RoleAssignmentOut(role=role, reviewer_ids=list(rids))
+                        for role, rids in sorted(per_role.items())
+                    ],
+                )
+                for mid, per_role in sorted(result.assignments.items())
+            ],
+            unsatisfied=None,
+        )
+
+    return RoleAssignResponse(
+        status="infeasible",
+        total_required=result.total_required,
+        total_assigned=result.total_assigned,
+        assignments=None,
+        unsatisfied=[RoleUnsatisfiedOut(**vars(u)) for u in result.unsatisfied],
     )
