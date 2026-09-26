@@ -33,6 +33,11 @@
 最后按 ID 破同；负载率全程以约分分数（整数分子/分母）表示与比较，**不依赖浮点数**，
 响应返回最优最大负载率的约分分数与改动数。
 
+`POST /assign-roles` 支持**多评审角色**：稿件声明各角色所需人数（`role_requirements`）、
+评审人声明可担任的角色（`roles`），全部稿件与角色在同一流网络中一次全局求解，保证
+**同一评审人对同一稿件至多承担一个角色**，并沿用主题、利益冲突、总容量与赛道限额规则；
+可行时返回按稿件、角色分组且顺序确定的完整名单，不可行时返回各角色缺口且不输出部分分配。
+
 ## 快速启动（单条命令）
 
 ```bash
@@ -47,6 +52,7 @@ docker compose up --build
 | --- | --- |
 | http://localhost:8000/health | 健康检查 |
 | http://localhost:8000/assign | 分配接口（POST） |
+| http://localhost:8000/assign-roles | 多评审角色分配接口（POST） |
 | http://localhost:8000/docs | Swagger 交互式文档 |
 | http://localhost:8000/redoc | ReDoc 文档 |
 
@@ -235,6 +241,110 @@ docker run -p 8000:8000 review-assign
 锁定后的**剩余**容量（因此可能为 0），割容量等于剩余网络最大流；`max_assignable`
 为**合法锁定名额 + 割容量**（即含锁定关系在内全局至多可满足的名额数）。锁定关系
 校验失败时不进行求解，`bottleneck_cut` 为 `null`（只返回 `locked_conflicts`）。
+
+### `POST /assign-roles`
+
+多评审角色分配：稿件通过 `role_requirements` 声明**各评审角色所需人数**，评审人通过
+`roles` 声明**可担任的角色列表**。主题匹配、利益冲突（含自稿）、评审总容量与分赛道
+限额规则与 `POST /assign` 完全一致。
+
+全部稿件、全部角色在**同一个流网络中一次全局求解**，而不是按角色分别分配：
+
+- **同一评审人对同一稿件至多承担一个角色**（即使其 `roles` 同时覆盖多个角色）；
+- 各角色名额共同受评审人**总容量** `capacity` 与**赛道限额** `track_capacities` 约束，
+  避免按角色先后分配时争用共享容量（前一角色占满容量导致后一角色无解）。
+
+请求体：
+
+```json
+{
+  "manuscripts": [
+    {"id": "m1", "authors": ["alice"], "topics": ["ml"],
+     "role_requirements": {"chair": 1, "reviewer": 1}},
+    {"id": "m2", "authors": ["bob"], "topics": ["db"], "track": "A",
+     "role_requirements": {"reviewer": 2}}
+  ],
+  "reviewers": [
+    {"id": "r1", "topics": ["ml", "db"], "capacity": 3, "roles": ["chair", "reviewer"]},
+    {"id": "r2", "topics": ["ml"], "capacity": 2, "roles": ["chair"]},
+    {"id": "r3", "topics": ["db"], "capacity": 2, "roles": ["reviewer"],
+     "track_capacities": {"A": 1}},
+    {"id": "r4", "topics": ["db"], "capacity": 2, "roles": ["reviewer"]}
+  ]
+}
+```
+
+字段规则：
+
+- 稿件 `role_requirements`：`角色名 -> 非负整数需求`；映射中未出现、或需求为 `0`
+  的角色不参与分配。稿件不再使用 `required_reviewers`。
+- 评审人 `roles`：可担任的角色名列表（重复项自动去重）；只有出现在该列表中的角色
+  才构成候选资格。其余字段（`topics`、`capacity`、`conflicted_authors`、
+  `conflicted_manuscripts`、`track_capacities`）含义与 `/assign` 相同。
+- 一名评审人在**不同稿件**上可以分别承担角色（受总容量与赛道限额约束）；仅在**同一
+  稿件**上被限制为至多一个角色。
+
+可行时响应（`200`）：名单按**稿件 ID、角色名**确定排序，组内评审人按 ID 排序，
+列表乱序输入不影响结果：
+
+```json
+{
+  "status": "feasible",
+  "total_required": 4,
+  "total_assigned": 4,
+  "assignments": [
+    {"manuscript_id": "m1", "role": "chair", "reviewer_ids": ["r2"]},
+    {"manuscript_id": "m1", "role": "reviewer", "reviewer_ids": ["r1"]},
+    {"manuscript_id": "m2", "role": "reviewer", "reviewer_ids": ["r1", "r4"]}
+  ],
+  "role_shortfalls": null,
+  "role_gaps": null
+}
+```
+
+上例体现了**全局求解的必要性**：若先分配 `chair` 把 `r1` 分给 `m1`，则 `m2` 的两名
+`reviewer` 无法同时满足（赛道 A 仅 `r1`/`r3`/`r4` 合格）；全局解把 `chair` 让给 `r2`，
+`r1` 改任 `m1` 的 `reviewer` 并兼顾 `m2`。
+
+不可行时响应（`200`，`assignments` 为 `null`，**不输出任何部分分配**）：
+
+```json
+{
+  "status": "infeasible",
+  "total_required": 2,
+  "total_assigned": 1,
+  "assignments": null,
+  "role_shortfalls": [
+    {
+      "manuscript_id": "m1",
+      "role": "reviewer",
+      "required": 1,
+      "assigned": 0,
+      "missing": 1,
+      "eligible_reviewers": 1,
+      "candidate_gap": 0,
+      "capacity_gap": 0,
+      "eligible_remaining_capacity": 4
+    }
+  ],
+  "role_gaps": [
+    {"role": "reviewer", "required": 1, "assigned": 0, "missing": 1}
+  ]
+}
+```
+
+该例中唯一评审 `r1` 同时具备 `chair` 与 `reviewer` 资格、容量也充足，但因**同一评审
+对同一稿件至多承担一个角色**，两个角色名额只能满足一个：`role_shortfalls` 给出各
+`(稿件, 角色)` 的缺口（按稿件 ID、角色名排序），`role_gaps` 给出**按角色汇总**的
+缺口（按角色名排序，仅列出 `missing > 0` 的角色）。诊断字段含义与 `/assign` 对应：
+
+- `eligible_reviewers`：通过主题、冲突与角色列表过滤的合格候选人数；
+- `eligible_remaining_capacity`：最大流结束后这些候选对该稿赛道的剩余可接量之和；
+- `candidate_gap`：候选人数缺口；`capacity_gap`：容量缺口。
+
+注意：`candidate_gap` / `capacity_gap` 是单角色视角的粗粒度提示；当瓶颈来自
+「同一评审人被同一稿件的多个角色争用」这一跨角色约束时（如上例），两者可能均为 `0`，
+此时以 `missing` 与 `role_gaps` 为准。
 
 ### 增量重排模式（可选）
 
@@ -557,6 +667,27 @@ curl -s -X POST http://localhost:8000/assign \
       }'
 # -> assignments 为 m1->r1、m2->r2（接受 1 新增 1 移除，把最大负载率从 1 压到 1/2）；
 #    balance = {"max_load_ratio": {"numerator": 1, "denominator": 2}, "changes": 2}
+
+# 多角色分配：全部稿件、全部角色一次全局求解；同一评审人对同一稿件至多承担一个角色
+curl -s -X POST http://localhost:8000/assign-roles \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "manuscripts": [
+          {"id": "m1", "authors": ["alice"], "topics": ["ml"],
+           "role_requirements": {"chair": 1, "reviewer": 1}},
+          {"id": "m2", "authors": ["bob"], "topics": ["db"], "track": "A",
+           "role_requirements": {"reviewer": 2}}
+        ],
+        "reviewers": [
+          {"id": "r1", "topics": ["ml", "db"], "capacity": 3, "roles": ["chair", "reviewer"]},
+          {"id": "r2", "topics": ["ml"], "capacity": 2, "roles": ["chair"]},
+          {"id": "r3", "topics": ["db"], "capacity": 2, "roles": ["reviewer"],
+           "track_capacities": {"A": 1}},
+          {"id": "r4", "topics": ["db"], "capacity": 2, "roles": ["reviewer"]}
+        ]
+      }'
+# -> 可行时按稿件、角色分组返回完整名单；不可行时 role_shortfalls / role_gaps
+#    给出各角色缺口，assignments 为 null（不输出部分结果）
 ```
 
 ## 算法与确定性
@@ -566,6 +697,13 @@ curl -s -X POST http://localhost:8000/assign \
 - 分赛道容量：稿件赛道出现在评审人 `track_capacities` 中时，稿件 -> 评审人 的边改经
   「(评审人, 赛道)」限额节点（`稿件 -> (评审人,赛道) -> 评审人`，中间边容量=赛道限额），
   赛道限额与总容量在同一流网络中联立求解；未列入映射的赛道仍走直边，只受总容量约束。
+- 多角色分配（`/assign-roles`）：建图为
+  `源 -> (稿件,角色)[需求] -> (稿件,评审人)[容量 1] -> 评审人 -> (评审人,赛道) -> 汇`，
+  `(稿件,角色)` 仅连向主题匹配、无冲突且声明可担任该角色的评审人所对应的
+  `(稿件,评审人)` 节点；该中间节点容量恒为 1，因此**同一评审人对同一稿件至多承担
+  一个角色**，而其出口与各角色名额共用评审总容量边与赛道限额边——全部稿件、全部角色
+  一次联立求解，避免按角色分别分配时争用共享容量。不可行时返回各 `(稿件,角色)` 与
+  按角色汇总的缺口，不输出任何部分分配。
 - 全局求解保证整体可行（逐稿贪心无法保证，例如 m1 可选 r1/r2、m2 仅可选 r1 且容量均为 1 时，
   贪心会失败而全局解为 m1→r2、m2→r1）。
 - 增量重排：锁定关系先逐一校验稿件需求、评审资格、总容量与分赛道限额（任一冲突即整体
@@ -604,9 +742,9 @@ uvicorn app.main:app --reload --port 8000   # 本地起服务
 
 ```
 app/
-  main.py      # FastAPI 入口：/health、/assign
+  main.py      # FastAPI 入口：/health、/assign、/assign-roles
   models.py    # 请求/响应模型与校验
-  solver.py    # 分配求解器：普通模式全局最大流 + 增量模式最小费用最大流 + 负载均衡字典序优化
+  solver.py    # 分配求解器：普通模式全局最大流 + 多角色联立最大流 + 增量最小费用最大流 + 负载均衡字典序优化
 tests/
   test_assign.py
 Dockerfile

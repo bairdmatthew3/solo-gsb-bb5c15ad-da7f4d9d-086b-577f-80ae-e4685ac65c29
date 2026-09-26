@@ -1789,3 +1789,376 @@ def test_balance_matches_brute_force():
     assert checked["feasible"] > 0
     assert checked["infeasible"] > 0
 
+
+
+# ---------- POST /assign-roles：多角色一次性全局分配 ----------
+
+def _verify_role_constraints(body: dict, response: dict) -> None:
+    """校验 /assign-roles 结果：角色人数、同人单角色、容量、赛道、主题、冲突回避。"""
+    assert response["status"] == "feasible"
+    assignments = {
+        (a["manuscript_id"], a["role"]): a["reviewer_ids"]
+        for a in response["assignments"]
+    }
+    reviewers = {r["id"]: r for r in body["reviewers"]}
+    manuscripts = {m["id"]: m for m in body["manuscripts"]}
+
+    pair_roles: dict[tuple[str, str], str] = {}
+    used = {rid: 0 for rid in reviewers}
+    track_used: dict[str, dict[str, int]] = {rid: {} for rid in reviewers}
+    for (mid, role), rid_list in assignments.items():
+        m = manuscripts[mid]
+        assert m["role_requirements"][role] == len(rid_list)
+        assert len(set(rid_list)) == len(rid_list)
+        for rid in rid_list:
+            assert role in reviewers[rid].get("roles", []), f"{rid} 不能担任 {role}"
+            # 同一评审人对同一稿件至多承担一个角色
+            assert (mid, rid) not in pair_roles, "同一评审人对同一稿件承担多个角色"
+            pair_roles[(mid, rid)] = role
+            r = reviewers[rid]
+            assert rid not in m["authors"], "自稿冲突"
+            assert not set(m["authors"]) & set(r.get("conflicted_authors", [])), "利益冲突"
+            assert m["id"] not in r.get("conflicted_manuscripts", [])
+            if m["topics"]:
+                assert set(m["topics"]) & set(r["topics"]), "主题不匹配"
+            used[rid] += 1
+            track = m.get("track")
+            if track is not None:
+                per = track_used[rid]
+                per[track] = per.get(track, 0) + 1
+    # 每个 (稿件, 角色) 需求都被满足
+    for m in body["manuscripts"]:
+        for role, n in m.get("role_requirements", {}).items():
+            assert len(assignments.get((m["id"], role), [])) == n
+    for rid, n in used.items():
+        assert n <= reviewers[rid]["capacity"], f"{rid} 超出容量"
+    for rid, per_track in track_used.items():
+        caps = reviewers[rid].get("track_capacities") or {}
+        for track, n in per_track.items():
+            if track in caps:
+                assert n <= caps[track], f"{rid} 赛道 {track} 超出限额"
+
+
+def test_assign_roles_basic_feasible():
+    body = {
+        "manuscripts": [
+            {"id": "m1", "authors": ["alice"], "topics": ["ml"],
+             "role_requirements": {"chair": 1, "reviewer": 2}},
+        ],
+        "reviewers": [
+            {"id": "r1", "topics": ["ml"], "capacity": 2, "roles": ["chair"]},
+            {"id": "r2", "topics": ["ml"], "capacity": 2, "roles": ["reviewer"]},
+            {"id": "r3", "topics": ["ml"], "capacity": 2, "roles": ["chair", "reviewer"]},
+        ],
+    }
+    data = client.post("/assign-roles", json=body).json()
+    assert data["status"] == "feasible"
+    assert data["total_required"] == 3
+    assert data["total_assigned"] == 3
+    assert data["role_shortfalls"] is None
+    assert data["role_gaps"] is None
+    _verify_role_constraints(body, data)
+    assignments = {
+        (a["manuscript_id"], a["role"]): a["reviewer_ids"]
+        for a in data["assignments"]
+    }
+    # 确定性：chair 取 ID 最小的合格评审 r1；两名 reviewer 为 r2、r3
+    assert assignments[("m1", "chair")] == ["r1"]
+    assert assignments[("m1", "reviewer")] == ["r2", "r3"]
+    # 按稿件 ID、角色名确定排序
+    assert [a["role"] for a in data["assignments"]] == ["chair", "reviewer"]
+
+
+def test_assign_roles_one_reviewer_one_role_per_manuscript():
+    """同一评审人对同一稿件至多承担一个角色：唯一评审可兼任时仍不可行。"""
+    body = {
+        "manuscripts": [
+            {"id": "m1", "authors": [], "topics": ["t"],
+             "role_requirements": {"chair": 1, "reviewer": 1}},
+        ],
+        "reviewers": [
+            {"id": "r1", "topics": ["t"], "capacity": 5,
+             "roles": ["chair", "reviewer"]},
+        ],
+    }
+    data = client.post("/assign-roles", json=body).json()
+    assert data["status"] == "infeasible"
+    # 不输出任何部分分配
+    assert data["assignments"] is None
+    assert data["total_required"] == 2
+    assert data["total_assigned"] == 1
+    roles_short = {s["role"]: s for s in data["role_shortfalls"]}
+    # 两个角色各需 1，r1 只能占其一；恰好一个角色缺 1
+    assert len(roles_short) == 1
+    missing_role, s = next(iter(roles_short.items()))
+    assert s["missing"] == 1
+    assert data["role_gaps"] == [
+        {"role": missing_role, "required": 1, "assigned": 0, "missing": 1}
+    ]
+
+
+def test_assign_roles_shared_total_capacity_contention():
+    """按角色分别分配会争用共享总容量：4 名额只有 3 总容量 -> 不可行。"""
+    body = {
+        "manuscripts": [
+            {"id": "m1", "authors": [], "topics": ["t"],
+             "role_requirements": {"chair": 1, "reviewer": 1}},
+            {"id": "m2", "authors": [], "topics": ["t"],
+             "role_requirements": {"chair": 1, "reviewer": 1}},
+        ],
+        "reviewers": [
+            {"id": "r1", "topics": ["t"], "capacity": 1, "roles": ["chair"]},
+            {"id": "r2", "topics": ["t"], "capacity": 1, "roles": ["reviewer"]},
+            {"id": "r3", "topics": ["t"], "capacity": 1,
+             "roles": ["chair", "reviewer"]},
+        ],
+    }
+    data = client.post("/assign-roles", json=body).json()
+    assert data["status"] == "infeasible"
+    assert data["assignments"] is None
+    assert data["total_required"] == 4
+    assert data["total_assigned"] == 3
+    assert sum(g["missing"] for g in data["role_gaps"]) == 1
+
+
+def test_assign_roles_global_matching_over_per_role_greedy():
+    """全局求解：m2 的 reviewer 只有 r3，m1 的 chair 必须让给 r1。
+
+    若按角色先后贪心（chair 先取 r3），m2 将无 reviewer 可分；
+    全局解为 m1/chair->r1、m2/reviewer->r3。
+    """
+    body = {
+        "manuscripts": [
+            {"id": "m1", "authors": [], "topics": ["t"],
+             "role_requirements": {"chair": 1}},
+            {"id": "m2", "authors": [], "topics": ["t"],
+             "role_requirements": {"reviewer": 1}},
+        ],
+        "reviewers": [
+            {"id": "r1", "topics": ["t"], "capacity": 1, "roles": ["chair"]},
+            {"id": "r3", "topics": ["t"], "capacity": 1,
+             "roles": ["chair", "reviewer"]},
+        ],
+    }
+    data = client.post("/assign-roles", json=body).json()
+    assert data["status"] == "feasible"
+    _verify_role_constraints(body, data)
+    assignments = {
+        (a["manuscript_id"], a["role"]): a["reviewer_ids"]
+        for a in data["assignments"]
+    }
+    assert assignments == {
+        ("m1", "chair"): ["r1"],
+        ("m2", "reviewer"): ["r3"],
+    }
+
+
+def test_assign_roles_same_reviewer_different_manuscripts():
+    """同一评审人可在不同稿件承担（不同或相同）角色，仅总容量受限。"""
+    body = {
+        "manuscripts": [
+            {"id": "m1", "authors": [], "topics": ["t"],
+             "role_requirements": {"chair": 1}},
+            {"id": "m2", "authors": [], "topics": ["t"],
+             "role_requirements": {"reviewer": 1}},
+        ],
+        "reviewers": [
+            {"id": "r1", "topics": ["t"], "capacity": 2,
+             "roles": ["chair", "reviewer"]},
+        ],
+    }
+    data = client.post("/assign-roles", json=body).json()
+    assert data["status"] == "feasible"
+    _verify_role_constraints(body, data)
+
+
+def test_assign_roles_respects_track_capacity():
+    """赛道限额被各角色名额共享：r1 在赛道 A 限额 1，两个角色名额须分给不同评审。"""
+    body = {
+        "manuscripts": [
+            {"id": "m1", "authors": [], "topics": ["t"], "track": "A",
+             "role_requirements": {"chair": 1, "reviewer": 1}},
+        ],
+        "reviewers": [
+            {"id": "r1", "topics": ["t"], "capacity": 5,
+             "track_capacities": {"A": 1}, "roles": ["chair", "reviewer"]},
+            {"id": "r2", "topics": ["t"], "capacity": 5,
+             "roles": ["chair", "reviewer"]},
+        ],
+    }
+    data = client.post("/assign-roles", json=body).json()
+    assert data["status"] == "feasible"
+    _verify_role_constraints(body, data)
+
+
+def test_assign_roles_track_capacity_infeasible():
+    """赛道限额不足：唯一评审赛道 A 限额 1，两个角色名额无法同时满足。"""
+    body = {
+        "manuscripts": [
+            {"id": "m1", "authors": [], "topics": ["t"], "track": "A",
+             "role_requirements": {"chair": 1, "reviewer": 1}},
+        ],
+        "reviewers": [
+            {"id": "r1", "topics": ["t"], "capacity": 5,
+             "track_capacities": {"A": 1}, "roles": ["chair", "reviewer"]},
+        ],
+    }
+    data = client.post("/assign-roles", json=body).json()
+    assert data["status"] == "infeasible"
+    assert data["assignments"] is None
+    assert data["total_assigned"] == 1
+    s = data["role_shortfalls"][0]
+    assert s["eligible_reviewers"] == 1
+    assert s["eligible_remaining_capacity"] == 0
+    assert s["capacity_gap"] == 1
+
+
+def test_assign_roles_conflict_and_topic_rules():
+    """沿用 /assign 的主题匹配与利益冲突规则，且角色列表也限定资格。"""
+    body = {
+        "manuscripts": [
+            {"id": "m1", "authors": ["alice"], "topics": ["ml"],
+             "role_requirements": {"chair": 2}},
+        ],
+        # r1 与作者冲突；r2 主题不匹配；r3 不具备 chair 角色；只有 r4 合格
+        "reviewers": [
+            {"id": "r1", "topics": ["ml"], "capacity": 5, "roles": ["chair"],
+             "conflicted_authors": ["alice"]},
+            {"id": "r2", "topics": ["db"], "capacity": 5, "roles": ["chair"]},
+            {"id": "r3", "topics": ["ml"], "capacity": 5, "roles": ["reviewer"]},
+            {"id": "r4", "topics": ["ml"], "capacity": 5, "roles": ["chair"]},
+        ],
+    }
+    data = client.post("/assign-roles", json=body).json()
+    assert data["status"] == "infeasible"
+    assert data["assignments"] is None
+    s = data["role_shortfalls"][0]
+    assert s["eligible_reviewers"] == 1
+    assert s["candidate_gap"] == 1
+    gaps = {g["role"]: g for g in data["role_gaps"]}
+    assert gaps["chair"]["missing"] == 1
+
+
+def test_assign_roles_role_gaps_aggregation_and_order():
+    """不可行时 role_gaps 按角色汇总，role_shortfalls 按 (稿件, 角色) 排序。"""
+    body = {
+        "manuscripts": [
+            {"id": "m1", "authors": [], "topics": ["t"],
+             "role_requirements": {"chair": 1, "reviewer": 1}},
+            {"id": "m2", "authors": [], "topics": ["t"],
+             "role_requirements": {"reviewer": 1}},
+        ],
+        # 仅 1 名评审，容量 1，可承担所有角色：至多满足 1 个名额
+        "reviewers": [
+            {"id": "r1", "topics": ["t"], "capacity": 1,
+             "roles": ["chair", "reviewer"]},
+        ],
+    }
+    data = client.post("/assign-roles", json=body).json()
+    assert data["status"] == "infeasible"
+    assert data["total_required"] == 3
+    assert data["total_assigned"] == 1
+    # shortfalls 按 (manuscript_id, role) 确定排序
+    keys = [(s["manuscript_id"], s["role"]) for s in data["role_shortfalls"]]
+    assert keys == sorted(keys)
+    # 缺口汇总守恒：sum(role_gaps.missing) = total_required - total_assigned
+    assert sum(g["missing"] for g in data["role_gaps"]) == 2
+    # role_gaps 按角色名排序，且只出现 missing>0 的角色
+    roles = [g["role"] for g in data["role_gaps"]]
+    assert roles == sorted(roles)
+    for g in data["role_gaps"]:
+        assert g["missing"] > 0
+        assert g["required"] - g["assigned"] == g["missing"]
+
+
+def test_assign_roles_deterministic_and_order_independent():
+    rng = random.Random(31)
+    roles = ["chair", "reviewer", "meta"]
+    body = {
+        "manuscripts": [
+            {
+                "id": f"m{i}", "authors": [],
+                "topics": rng.sample(["t1", "t2"], rng.randint(1, 2)),
+                "role_requirements": {
+                    r: rng.randint(1, 2) for r in roles if rng.random() < 0.7
+                },
+                **({"track": rng.choice(["A", "B"])} if rng.random() < 0.5 else {}),
+            }
+            for i in range(6)
+        ],
+        "reviewers": [
+            {
+                "id": f"r{j}",
+                "topics": rng.sample(["t1", "t2"], rng.randint(1, 2)),
+                "capacity": rng.randint(1, 4),
+                "roles": rng.sample(roles, rng.randint(1, 3)),
+                **({"track_capacities": {
+                    t: rng.randint(0, 2) for t in rng.sample(["A", "B"], 1)
+                }} if rng.random() < 0.5 else {}),
+            }
+            for j in range(7)
+        ],
+    }
+    r1 = client.post("/assign-roles", json=body).json()
+    r2 = client.post("/assign-roles", json=body).json()
+    assert r1 == r2
+    shuffled = {
+        "manuscripts": list(reversed(body["manuscripts"])),
+        "reviewers": list(reversed(body["reviewers"])),
+    }
+    r3 = client.post("/assign-roles", json=shuffled).json()
+    assert r1 == r3
+    if r1["status"] == "feasible":
+        _verify_role_constraints(body, r1)
+
+
+def test_assign_roles_empty_requirements_is_feasible():
+    body = {
+        "manuscripts": [{"id": "m1", "authors": [], "topics": ["t"]}],
+        "reviewers": [
+            {"id": "r1", "topics": ["t"], "capacity": 1, "roles": ["chair"]},
+        ],
+    }
+    data = client.post("/assign-roles", json=body).json()
+    assert data["status"] == "feasible"
+    assert data["assignments"] == []
+    assert data["total_required"] == 0
+
+
+def test_assign_roles_validates_unique_and_duplicate_roles():
+    # 稿件 ID 重复
+    resp = client.post("/assign-roles", json={
+        "manuscripts": [
+            {"id": "m1", "role_requirements": {"chair": 1}},
+            {"id": "m1", "role_requirements": {"chair": 1}},
+        ],
+        "reviewers": [],
+    })
+    assert resp.status_code == 422
+    # 评审人 roles 重复自动去重（不报 422）
+    resp = client.post("/assign-roles", json={
+        "manuscripts": [],
+        "reviewers": [
+            {"id": "r1", "capacity": 1, "roles": ["chair", "chair"]},
+        ],
+    })
+    assert resp.status_code == 200
+    # 非法字段 / 负数需求
+    resp = client.post("/assign-roles", json={
+        "manuscripts": [{"id": "m1", "role_requirements": {"chair": -1}}],
+        "reviewers": [],
+    })
+    assert resp.status_code == 422
+
+
+def test_assign_endpoint_still_available():
+    """新增 /assign-roles 后，/assign 行为保持可用且不变。"""
+    body = {
+        "manuscripts": [
+            {"id": "m1", "authors": [], "topics": ["t"], "required_reviewers": 1},
+        ],
+        "reviewers": [{"id": "r1", "topics": ["t"], "capacity": 1}],
+    }
+    data = client.post("/assign", json=body).json()
+    assert data["status"] == "feasible"
+    assert data["assignments"] == [{"manuscript_id": "m1", "reviewer_ids": ["r1"]}]

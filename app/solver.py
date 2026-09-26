@@ -51,6 +51,22 @@ max_cap）：先在 1/max_cap 整数网格上二分，把最优值定位到宽�
 运算，全程不引入浮点）；找到最优比例后，把收紧后的容量交给最小费用最大流完成
 第 2、3 级优化。无完整可行解时（负载率 1 仍不可行）沿用普通 / 增量模式的诊断，
 不输出任何部分分配。
+
+多角色分配模式（solve_role_assignment，POST /assign-roles）：
+
+稿件声明各评审角色所需人数，评审人声明可担任的角色；主题、利益冲突、总容量与
+分赛道限额规则与 /assign 完全一致。全部稿件、全部角色在**同一个流网络**中一次
+求解，而不是按角色分别分配（后者会争用评审人的总容量与赛道限额）：
+
+    源 -> (稿件,角色)[需求] -> (稿件,评审人)[容量 1] ->
+        评审人 -> (评审人,赛道)[赛道限额]（赛道受限时） -> 汇[总容量]
+
+(稿件,评审人) 中间节点入口容量为 1，强制**同一评审人对同一稿件至多承担一个角色**；
+该节点的出口边按稿件赛道经过 (评审人,赛道) 限额节点或评审人直边，使各角色名额
+共同受同一总容量与同一赛道限额约束。最大流等于总角色名额需求时可行，返回按
+稿件 ID、角色名确定排序的完整名单；否则判定不可行，返回各 (稿件,角色) 与按角色
+汇总的缺口，不输出任何部分分配。建图节点按业务 ID 排序、需求为 0 的角色不建节点，
+相同输入（甚至不同的列表顺序）必然产生完全相同的输出。
 """
 
 from __future__ import annotations
@@ -68,6 +84,8 @@ class ManuscriptSpec:
     topics: tuple[str, ...]
     required_reviewers: int
     track: str | None = None
+    # 多角色分配：(角色, 所需人数) 对，按角色名排序；缺省为空（/assign 普通接口）
+    role_requirements: tuple[tuple[str, int], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -79,6 +97,8 @@ class ReviewerSpec:
     conflicted_manuscripts: tuple[str, ...]
     # (赛道, 限额) 对，按赛道名排序；缺省为空表示不做分赛道限制
     track_capacities: tuple[tuple[str, int], ...] = ()
+    # 多角色分配：可担任的角色元组，按角色名排序去重；缺省为空（/assign 普通接口）
+    roles: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -182,6 +202,34 @@ class SolveResult:
     bottleneck_cut: BottleneckCut | None = None
     # 负载均衡模式且可行时的均衡结果；其余情形为 None
     balance: WorkloadBalance | None = None
+
+
+@dataclass(frozen=True)
+class RoleShortfall:
+    """多角色分配不可行时，单个 (稿件, 角色) 名额的缺口诊断。"""
+
+    manuscript_id: str
+    role: str
+    required: int
+    assigned: int
+    missing: int
+    eligible_reviewers: int
+    eligible_remaining_capacity: int
+    candidate_gap: int
+    capacity_gap: int
+
+
+@dataclass(frozen=True)
+class RoleSolveResult:
+    """多角色分配结果：可行时给出按 (稿件, 角色) 分组的完整名单。"""
+
+    feasible: bool
+    # (manuscript_id, role) -> 已排序的 reviewer id 元组；不可行时为空
+    assignments: dict[tuple[str, str], tuple[str, ...]]
+    total_required: int
+    total_assigned: int
+    # 不可行时各 (稿件, 角色) 的缺口（按稿件 ID、角色名排序）
+    shortfalls: tuple[RoleShortfall, ...] = ()
 
 
 class _MaxFlow:
@@ -1232,4 +1280,181 @@ def _solve_balanced(
             max_load_ratio_den=best_ratio.denominator,
             changes=changes,
         ),
+    )
+
+
+# ===================== 多角色一次性全局分配（/assign-roles） =====================
+
+
+def solve_role_assignment(
+    manuscripts: list[ManuscriptSpec],
+    reviewers: list[ReviewerSpec],
+) -> RoleSolveResult:
+    """多角色分配：全部稿件、全部角色在同一流网络中一次全局求解。
+
+    网络：源 -> (稿件,角色)[需求] -> (稿件,评审人)[容量 1] ->
+    评审人 -> (评审人,赛道)[赛道限额]（赛道受限时） -> 汇[总容量]。
+    (稿件,评审人) 节点容量为 1，强制同一评审人对同一稿件至多承担一个角色；
+    各角色名额共同流经评审总容量边与赛道限额边，避免按角色分别分配时争用容量。
+    """
+    # 按 ID 排序，保证建图顺序与输入列表顺序无关 -> 输出稳定
+    ms = sorted(manuscripts, key=lambda m: m.id)
+    rs = sorted(reviewers, key=lambda r: r.id)
+    m_count, r_count = len(ms), len(rs)
+
+    # 每篇稿件仅保留需求 > 0 的角色，按角色名排序（需求 0 不建节点）
+    m_roles: list[list[tuple[str, int]]] = [
+        [(role, n) for role, n in sorted(m.role_requirements) if n > 0] for m in ms
+    ]
+    reviewer_roles: list[set[str]] = [set(r.roles) for r in rs]
+    role_flat: list[tuple[int, str]] = [
+        (i, role) for i in range(m_count) for role, _n in m_roles[i]
+    ]
+
+    # 合格候选：/assign 的主题/冲突资格 + 评审人声明可担任该角色
+    m_eligible: list[list[int]] = [_eligible_reviewers(m, rs) for m in ms]
+    mr_roles: dict[tuple[int, int], set[str]] = {}
+    for i in range(m_count):
+        for j in m_eligible[i]:
+            common = {role for role, _n in m_roles[i] if role in reviewer_roles[j]}
+            if common:
+                mr_roles[(i, j)] = common
+
+    total_required = sum(n for roles in m_roles for _role, n in roles)
+
+    # ---- 确定性节点布局：SRC | (稿件,角色) | (稿件,评审人) | 评审人 | (评审人,赛道) | SNK ----
+    def role_node(k: int) -> int:
+        return 1 + k
+
+    mr_base = 1 + len(role_flat)
+    mr_index: dict[tuple[int, int], int] = {}
+    nxt = mr_base
+    for i in range(m_count):
+        for j in m_eligible[i]:
+            mr_index[(i, j)] = nxt
+            nxt += 1
+    r_base = nxt
+    r_node_idx = [r_base + j for j in range(r_count)]
+    track_base = r_base + r_count
+    track_node_idx: list[dict[str, int]] = []
+    for j, r in enumerate(rs):
+        nodes: dict[str, int] = {}
+        for track, _cap in sorted(r.track_capacities):
+            nodes[track] = track_base + len(nodes) + sum(
+                len(track_node_idx[k]) for k in range(j)
+            )
+        track_node_idx.append(nodes)
+    SNK = track_base + sum(len(r.track_capacities) for r in rs)
+
+    mf = _MaxFlow(SNK + 1)
+
+    # 源 -> (稿件,角色)：该角色需求
+    for k, (i, role) in enumerate(role_flat):
+        n_req = next(n for r_name, n in m_roles[i] if r_name == role)
+        mf.add_edge(0, role_node(k), n_req)
+    # (稿件,角色) -> (稿件,评审人)：仅当评审人对该稿合格且可担任该角色
+    for k, (i, role) in enumerate(role_flat):
+        for j in m_eligible[i]:
+            if role in mr_roles.get((i, j), ()):
+                mf.add_edge(role_node(k), mr_index[(i, j)], 1)
+    # (稿件,评审人) -> 评审人（赛道受限时经 (评审人,赛道) 限额节点）：容量 1
+    for (i, j), k_mr in mr_index.items():
+        track = ms[i].track
+        tnode = track_node_idx[j].get(track) if track is not None else None
+        target = tnode if tnode is not None else r_node_idx[j]
+        mf.add_edge(k_mr, target, 1)
+    # (评审人,赛道) -> 评审人：赛道限额
+    for j in range(r_count):
+        for track, node in sorted(track_node_idx[j].items()):
+            cap = dict(rs[j].track_capacities)[track]
+            mf.add_edge(node, r_node_idx[j], cap)
+    # 评审人 -> 汇：总容量
+    for j, r in enumerate(rs):
+        mf.add_edge(r_node_idx[j], SNK, r.capacity)
+
+    total_assigned = mf.max_flow(0, SNK)
+
+    def assigned_for(i: int, j: int) -> int:
+        """(稿件 i, 评审人 j) 中间节点的流入量（0 或 1）。"""
+        k_mr = mr_index[(i, j)]
+        return mf.cap[r_node_idx[j]][k_mr] + sum(
+            mf.cap[track_node_idx[j][t]][k_mr]
+            for t in track_node_idx[j]
+        )
+
+    def flow_role(i: int, j: int) -> str | None:
+        """承担稿件 i 的评审人 j 实际被分配到的角色（容量 1 保证至多一个）。"""
+        k_mr = mr_index[(i, j)]
+        for k, (mi, role) in enumerate(role_flat):
+            if mi == i and mf.cap[k_mr][role_node(k)] > 0:
+                return role
+        return None
+
+    if total_assigned == total_required:
+        assignments: dict[tuple[str, str], tuple[str, ...]] = {}
+        picked: dict[tuple[int, str], list[str]] = {
+            (i, role): [] for i, role in role_flat
+        }
+        for (i, j) in mr_index:
+            if assigned_for(i, j) > 0:
+                role = flow_role(i, j)
+                # 完整可行解：每个被占用的 (稿件,评审人) 必携带恰好一个角色
+                assert role is not None
+                picked[(i, role)].append(rs[j].id)
+        for (i, role), rids in picked.items():
+            assignments[(ms[i].id, role)] = tuple(sorted(rids))
+        return RoleSolveResult(
+            feasible=True,
+            assignments=assignments,
+            total_required=total_required,
+            total_assigned=total_assigned,
+        )
+
+    # ---- 不可行：各 (稿件,角色) 缺口诊断，不输出任何部分分配 ----
+    def remaining_capacity(j: int, track: str | None) -> int:
+        """评审人 j 对该赛道稿件的剩余可接量：总剩余与赛道剩余取小。"""
+        remaining = mf.cap[r_node_idx[j]][SNK]
+        if track is not None:
+            node = track_node_idx[j].get(track)
+            if node is not None:
+                remaining = min(remaining, mf.cap[node][r_node_idx[j]])
+        return remaining
+
+    # 最大流结束后每对 (稿件,评审人) 的实际承担情况，用于各角色 assigned 统计
+    assigned_role: dict[tuple[int, int], str] = {}
+    for (i, j) in mr_index:
+        if assigned_for(i, j) > 0:
+            role = flow_role(i, j)
+            if role is not None:
+                assigned_role[(i, j)] = role
+
+    shortfalls: list[RoleShortfall] = []
+    for k, (i, role) in enumerate(role_flat):
+        required = next(n for r_name, n in m_roles[i] if r_name == role)
+        assigned = sum(
+            1 for (mi, j), rr in assigned_role.items() if mi == i and rr == role
+        )
+        if assigned >= required:
+            continue
+        missing = required - assigned
+        elig = [j for j in m_eligible[i] if role in mr_roles.get((i, j), ())]
+        remaining = sum(remaining_capacity(j, ms[i].track) for j in elig)
+        shortfalls.append(RoleShortfall(
+            manuscript_id=ms[i].id,
+            role=role,
+            required=required,
+            assigned=assigned,
+            missing=missing,
+            eligible_reviewers=len(elig),
+            eligible_remaining_capacity=remaining,
+            candidate_gap=max(0, required - len(elig)),
+            capacity_gap=max(0, missing - remaining),
+        ))
+
+    return RoleSolveResult(
+        feasible=False,
+        assignments={},
+        total_required=total_required,
+        total_assigned=total_assigned,
+        shortfalls=tuple(shortfalls),
     )

@@ -8,6 +8,8 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 _TrackName = Annotated[str, Field(min_length=1, max_length=128)]
 _TrackCapacity = Annotated[int, Field(ge=0, le=1000)]
+_RoleName = Annotated[str, Field(min_length=1, max_length=128)]
+_RoleCount = Annotated[int, Field(ge=0, le=100)]
 
 
 class ManuscriptIn(BaseModel):
@@ -224,3 +226,91 @@ class AssignResponse(BaseModel):
     bottleneck_cut: BottleneckCutOut | None = None
     # balance_workload 启用且可行时的负载均衡结果；否则为 null
     balance: WorkloadBalanceOut | None = None
+
+
+# ---------- POST /assign-roles：多评审角色一次性全局分配 ----------
+
+
+class RoleManuscriptIn(ManuscriptIn):
+    """/assign-roles 的稿件：除主题/作者/赛道外，声明各角色所需人数。"""
+
+    role_requirements: dict[_RoleName, _RoleCount] = Field(
+        default_factory=dict,
+        max_length=64,
+        description=(
+            "评审角色 -> 该角色所需人数（非负整数）。映射中未出现的角色视为不需求；"
+            "所有稿件、所有角色的名额在同一个流网络中一次性全局求解"
+        ),
+    )
+
+
+class RoleReviewerIn(ReviewerIn):
+    """/assign-roles 的评审人：除主题/容量/赛道限额外，声明可担任的角色列表。"""
+
+    roles: list[_RoleName] = Field(
+        default_factory=list,
+        max_length=64,
+        description="该评审人可担任的评审角色列表（重复项自动去重）",
+    )
+
+
+class AssignRolesRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    manuscripts: list[RoleManuscriptIn] = Field(max_length=10000)
+    reviewers: list[RoleReviewerIn] = Field(max_length=10000)
+
+    @model_validator(mode="after")
+    def _check_unique_ids(self) -> "AssignRolesRequest":
+        m_ids = [m.id for m in self.manuscripts]
+        if len(m_ids) != len(set(m_ids)):
+            raise ValueError("manuscripts 中存在重复的 id")
+        r_ids = [r.id for r in self.reviewers]
+        if len(r_ids) != len(set(r_ids)):
+            raise ValueError("reviewers 中存在重复的 id")
+        return self
+
+
+class RoleAssignmentOut(BaseModel):
+    manuscript_id: str
+    role: str
+    reviewer_ids: list[str]
+
+
+class RoleShortfallOut(BaseModel):
+    """不可行时，单个 (稿件, 角色) 名额的缺口诊断。"""
+
+    manuscript_id: str
+    role: str
+    required: int
+    assigned: int
+    missing: int
+    # 主题匹配、无利益冲突且声明可担任该角色的合格候选人数
+    eligible_reviewers: int
+    # 需求 - 合格候选人数（候选人本身不足）
+    candidate_gap: int
+    # 缺口 - 合格候选对该稿赛道的剩余可接量之和（候选够但容量不足）
+    capacity_gap: int
+    # 最大流结束后合格候选对该稿赛道的剩余可接量之和
+    eligible_remaining_capacity: int
+
+
+class RoleGapOut(BaseModel):
+    """不可行时按角色汇总的缺口。"""
+
+    role: str
+    required: int
+    assigned: int
+    missing: int
+
+
+class AssignRolesResponse(BaseModel):
+    status: Literal["feasible", "infeasible"]
+    total_required: int
+    total_assigned: int
+    # 可行时按稿件 ID、角色名确定排序的完整名单；不可行时为 null（不输出部分结果）
+    assignments: list[RoleAssignmentOut] | None
+    # 不可行时各 (稿件, 角色) 的缺口（按稿件 ID、角色名排序）；可行时为 null
+    role_shortfalls: list[RoleShortfallOut] | None
+    # 不可行时按角色汇总的缺口（按角色名排序，missing>0 的角色才出现）；可行时为 null
+    role_gaps: list[RoleGapOut] | None
